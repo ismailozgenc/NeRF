@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class NeRF(nn.Module):
     def __init__(self,
@@ -28,10 +29,7 @@ class NeRF(nn.Module):
         self.dir_linear = nn.Linear(input_ch_dir + W, W // 2)
         self.rgb_layer = nn.Linear(W // 2, 3)
 
-    def forward(self,
-                x: torch.Tensor,      # [..., input_ch]
-                d: torch.Tensor       # [..., input_ch_dir]
-               ) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor, d: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         h = x
         for i, layer in enumerate(self.pts_linears):
             if isinstance(layer, nn.Linear) and i // 2 in self.skips and i % 2 == 0:
@@ -41,9 +39,14 @@ class NeRF(nn.Module):
         sigma = self.sigma_layer(h)
 
         features = self.feature_layer(h)
+        if features.dim() == 3:
+            features = features.view(-1, features.shape[-1])  # flatten batch and samples dims
+
+        # now d and features both (B*N, feature_dim)
         h_dir = torch.cat([features, d], dim=-1)
         h_dir = self.dir_linear(h_dir)
-        h_dir = nn.functional.relu(h_dir)
+        h_dir = F.relu(h_dir)
         rgb = self.rgb_layer(h_dir)
 
         return rgb, sigma
+

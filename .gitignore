@@ -2,4 +2,4 @@
 data/
 nerf/__pycache__/
 checkpoints/
-logs/events.out.tfevents.1753686243.Quikkers-ROG.13904.0
+logs/

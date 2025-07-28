@@ -7,7 +7,7 @@ def get_rays(height: int,
              tvec: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     dtype = qvec.dtype
     device = qvec.device
-    intr = intrinsics['params'].clone().detach().to(device=device, dtype=dtype)
+    intr = torch.tensor(intrinsics['params'], device=device, dtype=dtype)
     tvec = tvec.to(device=device, dtype=dtype)
 
     i, j = torch.meshgrid(
