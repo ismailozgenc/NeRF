@@ -30,6 +30,20 @@ opt     = torch.optim.Adam(model.parameters(), lr=LR)
 def psnr(mse):
     return -10.0 * torch.log10(mse)
 
+best_psnr = float('-inf')
+
+ckpt_path = os.path.join(CKPT_DIR, "nerf_best.pth")
+if os.path.exists(ckpt_path):
+    ckpt = torch.load(ckpt_path, map_location=device)
+    model.load_state_dict(ckpt["model"])
+    opt.load_state_dict(ckpt["opt"])
+    start_iter = ckpt["iter"] + 1
+    best_psnr  = ckpt.get("best_psnr", float('-inf'))
+    print(f"[Checkpoint Loaded] Resuming from iter {start_iter}, best_psnr={best_psnr:.2f}")
+else:
+    start_iter = 1
+    best_psnr  = float('-inf')
+
 for i in range(1, N_ITERS + 1):
     img_data = dataset[i % len(dataset)]
     img      = torch.from_numpy(img_data["image"]).float().to(device)
@@ -73,13 +87,25 @@ for i in range(1, N_ITERS + 1):
         writer.add_scalar("train/psnr", v_psnr, i)
         print(f"iter {i:06d}  loss={mse:.6f}  psnr={v_psnr:.2f}")
 
+        if v_psnr > best_psnr:
+            best_psnr = v_psnr
+            ckpt = {
+                "iter": i,
+                "model": model.state_dict(),
+                "opt":   opt.state_dict(),
+                "best_psnr": best_psnr,
+            }
+            torch.save(ckpt, os.path.join(CKPT_DIR, "nerf_best.pth"))
+            print(f"[Best Model Saved] iter {i:06d}, psnr={best_psnr:.2f}")
+
     if i % (LOG_INTERVAL * 50) == 0:
         ckpt = {
             "iter": i,
             "model": model.state_dict(),
             "opt":   opt.state_dict(),
+            "best_psnr": best_psnr,
         }
         torch.save(ckpt, os.path.join(CKPT_DIR, f"nerf_ckpt_{i:06d}.pth"))
-        print(f"[Checkpoint saved] iter {i:06d}")
-
+        print(f"[Checkpoint Saved] iter {i:06d}")
+        
 writer.close()
