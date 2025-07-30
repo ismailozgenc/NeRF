@@ -3,3 +3,4 @@ data/
 nerf/__pycache__/
 checkpoints/
 logs/
+utils/__pycache__/
