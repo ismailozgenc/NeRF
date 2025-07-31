@@ -7,6 +7,7 @@ from nerf.encoding import positional_encoding
 from nerf.model import NeRF
 from utils.config import *
 from utils.helpers import load_checkpoint, save_checkpoint
+from datetime import datetime
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 os.makedirs(CKPT_DIR, exist_ok=True)
@@ -62,7 +63,5 @@ for i in range(start_iter, N_ITERS + 1):
     if v_psnr > best_psnr:
         best_psnr = v_psnr
         save_checkpoint(model, opt, best_psnr, i, ckpt_path)
-        print(f"[Best Model Saved] iter {i:06d}, psnr={best_psnr:.2f}")
-        
-    if i % LOG_INTERVAL == 0:
-        print(f"Iteration: {i:06d}  loss={mse:.4f} psnr:{v_psnr:.2f}")
+        print(f"BM Saved at iteration {i}, loss={mse:.4f}, psnr={v_psnr:.2f}, time={datetime.now().strftime('%H:%M')}")
+         

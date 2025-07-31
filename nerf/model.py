@@ -36,17 +36,19 @@ class NeRF(nn.Module):
                 h = torch.cat([h, x], dim=-1)
             h = layer(h)
 
-        sigma = self.sigma_layer(h)
+        # sigma must be non-negative
+        sigma = F.softplus(self.sigma_layer(h))
 
         features = self.feature_layer(h)
         if features.dim() == 3:
             features = features.view(-1, features.shape[-1])  # flatten batch and samples dims
 
-        # now d and features both (B*N, feature_dim)
+        # concatenate encoded direction with features
         h_dir = torch.cat([features, d], dim=-1)
         h_dir = self.dir_linear(h_dir)
         h_dir = F.relu(h_dir)
-        rgb = self.rgb_layer(h_dir)
+
+        # rgb values bounded to [0,1]
+        rgb = torch.sigmoid(self.rgb_layer(h_dir))
 
         return rgb, sigma
-

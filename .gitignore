@@ -4,3 +4,4 @@ nerf/__pycache__/
 checkpoints/
 logs/
 utils/__pycache__/
+__pycache__/train.cpython-312.pyc

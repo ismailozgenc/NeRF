@@ -79,4 +79,6 @@ def volume_render(rgb: torch.Tensor,
     # Flatten
     comp_rgb = comp_rgb.view(-1, 3)
     depth    = depth.view(-1)
+#    return comp_rgb, depth, weights
+
     return comp_rgb, depth
