@@ -9,21 +9,21 @@ def get_rays(height: int,
     intr = torch.tensor(intrinsics['params'], device=device, dtype=dtype)
     tvec = tvec.to(device=device, dtype=dtype)
 
-    # Create pixel coordinate grid
-    i, j = torch.meshgrid(
-        torch.linspace(0, width - 1, width, device=device, dtype=dtype),
+    # build pixel grid of shape (height, width)
+    j, i = torch.meshgrid(
         torch.linspace(0, height - 1, height, device=device, dtype=dtype),
-        indexing='xy'
+        torch.linspace(0, width  - 1, width,  device=device, dtype=dtype),
+        indexing='ij'
     )
 
-    # Camera-space ray directions
+    # camera-space directions
     dirs = torch.stack([
         (i - intr[2]) / intr[0],
         (j - intr[3]) / intr[1],
         torch.ones_like(i)
-    ], dim=-1)
+    ], dim=-1)  # (height, width, 3)
 
-    # Build rotation matrix from quaternion
+    # quaternion → rotation matrix
     qw, qx, qy, qz = qvec
     R = torch.tensor([
         [1 - 2*(qy**2 + qz**2),   2*(qx*qy - qz*qw),   2*(qx*qz + qy*qw)],
@@ -31,13 +31,19 @@ def get_rays(height: int,
         [2*(qx*qz - qy*qw),   2*(qy*qz + qx*qw), 1 - 2*(qx**2 + qy**2)]
     ], device=device, dtype=dtype)
 
-    # Rotate and normalize directions
+    # correct camera origin in world coordinates
+    cam_center = -R.T @ tvec
+
+    # rotate & normalize
     rays_d = (dirs[..., None, :] @ R.T).squeeze(-2)
     rays_d = rays_d / rays_d.norm(dim=-1, keepdim=True)
 
-    # Ray origins (same for every pixel)
-    rays_o = tvec.expand_as(rays_d)
+    # origins (same center for all rays)
+    rays_o = cam_center.expand_as(rays_d)
+
     return rays_o, rays_d
+
+
 
 def sample_points(rays_o: torch.Tensor,
                   rays_d: torch.Tensor,
@@ -51,34 +57,76 @@ def sample_points(rays_o: torch.Tensor,
     return pts, t_vals
 
 
-def volume_render(rgb: torch.Tensor,
-                  sigma: torch.Tensor,
-                  t_vals: torch.Tensor,
-                  rays_d: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    # Move t_vals to the correct device
+def volume_render(rgb, sigma, t_vals, rays_d):
+    # move to correct device/dtype
     t_vals = t_vals.to(rgb.device)
 
-    # Compute deltas as shape (1, N_samples)
-    deltas = t_vals[1:] - t_vals[:-1]
-    deltas = torch.cat([deltas, deltas[-1:]], dim=0)
-    deltas = deltas.view(1, -1)
+    # ensure t_vals is (batch, N)
+    if t_vals.dim() == 1:
+        t = t_vals.unsqueeze(0).expand(rgb.shape[0], -1)
+    else:
+        t = t_vals
 
-    # Density → alpha
-    alpha = 1.0 - torch.exp(-sigma.squeeze(-1) * deltas)
-    # Transmittance
-    trans = torch.cumprod(torch.cat([
-        torch.ones_like(alpha[..., :1]),
-        1.0 - alpha + 1e-10
-    ], dim=-1), dim=-1)[..., :-1]
-    weights = alpha * trans
+    if t_vals.dim() == 1:
+        deltas = t_vals[1:] - t_vals[:-1]
+        deltas = torch.cat([deltas, deltas[-1:]], dim=0).view(1, -1)
+    else:
+        deltas = t_vals[..., 1:] - t_vals[..., :-1]
+        deltas = torch.cat([deltas, deltas[..., -1:]], dim=-1)
 
-    # Composite
-    comp_rgb = (weights.unsqueeze(-1) * rgb).sum(dim=-2)  # (batch,3)
-    depth    = (weights * t_vals).sum(dim=-1)            # (batch,)
+    alpha = 1.0 - torch.exp(-sigma.squeeze(-1) * deltas)  # (batch, N)
 
-    # Flatten
-    comp_rgb = comp_rgb.view(-1, 3)
-    depth    = depth.view(-1)
-#    return comp_rgb, depth, weights
+    trans = torch.cumprod(
+        torch.cat([torch.ones_like(alpha[..., :1]), 1.0 - alpha + 1e-10], dim=-1),
+        dim=-1
+    )[..., :-1]  # (batch, N)
+    weights = alpha * trans  # (batch, N)
+    comp_rgb = (weights.unsqueeze(-1) * rgb).sum(dim=-2)  # (batch, 3)
+    depth = (weights * t).sum(dim=-1)                    # (batch,)
+    return comp_rgb, depth, weights
 
-    return comp_rgb, depth
+
+def sample_pdf(bins, weights, N_samples, det=False):
+    """
+    bins:   (R, N_bins) = typically t_co
+    weights:(R, N_bins) = typically weights from volume_render
+    returns: (R, N_samples)
+    """
+    # Ensure both are 2D
+    if bins.dim() == 3:
+        bins = bins.squeeze(0)
+    if weights.dim() == 3:
+        weights = weights.squeeze(0)
+
+    assert bins.shape == weights.shape, f"bins {bins.shape}, weights {weights.shape} mismatch"
+
+    R, B = bins.shape
+
+    # PDF + CDF
+    weights = weights + 1e-5
+    pdf = weights / torch.sum(weights, dim=-1, keepdim=True)
+    cdf = torch.cumsum(pdf, dim=-1)
+    cdf = torch.cat([torch.zeros(R, 1, device=cdf.device), cdf], dim=-1)  # (R, B+1)
+
+    # Draw uniform samples
+    if det:
+        u = torch.linspace(0., 1., N_samples, device=bins.device).unsqueeze(0).expand(R, N_samples)
+    else:
+        u = torch.rand(R, N_samples, device=bins.device)
+
+    # Invert CDF
+    inds = torch.searchsorted(cdf, u, right=True)
+    below = torch.clamp(inds - 1, min=0)
+    above = torch.clamp(inds, max=B)
+
+    cdf_b = torch.gather(cdf, 1, below)
+    cdf_a = torch.gather(cdf, 1, above)
+    bins_b = torch.gather(bins, 1, below.clamp(max=B-1))
+    bins_a = torch.gather(bins, 1, (above-1).clamp(max=B-1))
+
+    denom = (cdf_a - cdf_b)
+    denom[denom < 1e-5] = 1
+    t = (u - cdf_b) / denom
+    samples = bins_b + t * (bins_a - bins_b)
+
+    return samples

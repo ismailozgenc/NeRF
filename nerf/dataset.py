@@ -3,26 +3,40 @@ import os
 from PIL import Image
 
 def load_cameras_txt(path):
-    """
-    Parse cameras.txt (COLMAP format) and return a dict:
-      {camera_id: { 'model': str,
-                    'width': int,
-                    'height': int,
-                    'params': np.array([...]) }}
-    """
     cams = {}
     with open(path, 'r') as f:
         for line in f:
             if line.startswith('#') or not line.strip():
                 continue
-            cam_id, model, w, h, *params = line.split()
-            cams[int(cam_id)] = {
-                'model': model,
-                'width':  int(w),
-                'height': int(h),
-                'params': np.array(params, dtype=float)
+            elems = line.split()
+            cam_id = int(elems[0])
+            model  = elems[1]
+            w, h   = int(elems[2]), int(elems[3])
+            params = np.array(elems[4:], dtype=float)
+
+            if model == "SIMPLE":
+                # COLMAP’s SIMPLE: fx, cx, cy
+                fx, cx, cy = params
+                fy = fx
+                intr = [fx, fy, cx, cy]
+            elif model == "SIMPLE_RADIAL":
+                # fx, cx, cy, k → radial; drop k
+                fx, cx, cy, _ = params
+                fy = fx
+                intr = [fx, fy, cx, cy]
+            else:
+                # PINHOLE or other: fx, fy, cx, cy
+                fx, fy, cx, cy = params[:4]
+                intr = [fx, fy, cx, cy]
+
+            cams[cam_id] = {
+                'model':   model,
+                'width':   w,
+                'height':  h,
+                'params':  np.array(intr, dtype=float)
             }
     return cams
+
 
 def load_images_txt(path):
     """

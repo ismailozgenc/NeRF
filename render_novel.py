@@ -1,57 +1,88 @@
+import os
 import torch
 from PIL import Image
-from nerf.render import get_rays, sample_points, volume_render
+import numpy as np
+from tqdm import tqdm
+from nerf.render import get_rays, sample_points, volume_render, sample_pdf
 from nerf.encoding import positional_encoding
 from nerf.model import NeRF
-from utils.config import * 
+from utils.config import *
+from utils.helpers import load_checkpoint
+from nerf.dataset import load_colmap_dataset
 
-# --- Setup ---
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device.type}")
+def load_novel_view_data(data_dir, img_dir):
+    dataset = load_colmap_dataset(data_dir, img_dir)
+    poses = [(torch.from_numpy(d['qvec']).float(), torch.from_numpy(d['tvec']).float()) for d in dataset]
 
-ckpt = torch.load("checkpoints/nerf_best.pth", map_location=device)
-print(ckpt["best_psnr"])
-model = NeRF().to(device)
-model.load_state_dict(ckpt["model"])
-model.eval()
+    cam = dataset[0]['intrinsics']
+    if isinstance(cam, dict):
+        if 'params' in cam:
+            fx, fy, cx, cy = cam['params'][:4]
+        else:
+            fx, fy, cx, cy = cam.get('fx'), cam.get('fy'), cam.get('cx'), cam.get('cy')
+        intrinsics = torch.tensor([[fx, 0, cx],[0, fy, cy],[0,0,1]], dtype=torch.float32)
+    else:
+        intrinsics = torch.from_numpy(np.array(cam, dtype=np.float32))
 
-H, W = 2304, 3072
-intr = {'params': torch.tensor([800.0, 800.0, W/2, H/2], device=device)}
-qvec = torch.tensor([0.9239, 0.0, 0.3827, 0.0], device=device)
-tvec = torch.tensor([1.2, 0.5, -4.0], device=device)
+    H, W = dataset[0]['image'].shape[:2]
+    return poses, intrinsics, H, W
 
-# Generating rays
-rays_o, rays_d = get_rays(H, W, intr, qvec, tvec)
-rays_o = rays_o.reshape(-1, 3)
-rays_d = rays_d.reshape(-1, 3)
+def render_novel_view(model_coarse, model_fine, H, W, intrinsics, qvec, tvec, chunk_size=1024, device="cpu"):
+    # Prepare COLMAP-style intrinsics dict
+    fx, fy = intrinsics[0,0].item(), intrinsics[1,1].item()
+    cx, cy = intrinsics[0,2].item(), intrinsics[1,2].item()
+    cam_dict = {'params': [fx, fy, cx, cy]}
 
-# Batched rendering
-total_rays = rays_d.shape[0]
-batch_size = 4096 * 4
-rendered_chunks = []
-print(f"Rendering {total_rays} rays in batches of {batch_size}...")
+    # Generate rays
+    rays_o, rays_d = get_rays(H, W, cam_dict, qvec.to(device), tvec.to(device))
+    rays_o, rays_d = rays_o.reshape(-1,3), rays_d.reshape(-1,3)
+    rgb_chunks = []
 
-for i in range(0, total_rays, batch_size):
-    ro_batch = rays_o[i:i+batch_size].to(device)
-    rd_batch = rays_d[i:i+batch_size].to(device)
-
-    pts, t_vals = sample_points(ro_batch, rd_batch, NEAR, FAR, N_SAMPLES)
-    pts_flat    = pts.reshape(-1, 3)
-
-    pe_pts = positional_encoding(pts_flat, 10, True)
-    pe_dir = positional_encoding(rd_batch, 4, True)
-
+    total_chunks = (rays_o.shape[0] + chunk_size - 1) // chunk_size
+    # No gradient needed for inference
     with torch.no_grad():
-        rgb, sig = model(pe_pts, pe_dir.repeat_interleave(64, dim=0))
-        rgb = rgb.view(-1, 64, 3)
-        sig = sig.view(-1, 64, 1)
-        comp, _ = volume_render(rgb, sig, t_vals, rd_batch)
-        rendered_chunks.append(comp.cpu())
+        for i in tqdm(range(0, rays_o.shape[0], chunk_size), desc="Rendering chunks", total=total_chunks):
+            ro = rays_o[i:i+chunk_size].to(device)
+            rd = rays_d[i:i+chunk_size].to(device)
 
-print("Batch rendering complete.")
+            # Coarse pass
+            pts_co, t_co = sample_points(ro, rd, NEAR, FAR, N_SAMPLES)
+            pe_co  = positional_encoding(pts_co.reshape(-1,3), FREQ_POS)
+            pe_dir = positional_encoding(rd.unsqueeze(1).expand(-1, N_SAMPLES,3).reshape(-1,3), FREQ_DIR)
+            rgb_co, sig_co = model_coarse(pe_co, pe_dir)
+            rgb_co = rgb_co.view(-1, N_SAMPLES,3); sig_co = sig_co.view(-1, N_SAMPLES,1)
+            comp_co, _, weights = volume_render(rgb_co, sig_co, t_co, rd)
 
-img_flat = torch.cat(rendered_chunks, dim=0)[:H*W]
-img = img_flat.view(H, W, 3)
-img_np = (img.clamp(0.0, 1.0).numpy() * 255).astype("uint8")
-Image.fromarray(img_np).save(f"novel_view PSNR{ckpt["best_psnr"]:.1f}.png")
-print("Saved novel_view.png")
+            # Fine sampling
+            bins = t_co.unsqueeze(0).expand(weights.shape[0], -1)
+            t_fine = sample_pdf(bins, weights, N_IMPORTANCE)
+            t_all = torch.sort(torch.cat([bins, t_fine],dim=-1), dim=-1)[0]
+
+            # Fine pass
+            pts_fi = ro.unsqueeze(1) + rd.unsqueeze(1)*t_all[...,None]
+            pe_fi   = positional_encoding(pts_fi.reshape(-1,3), FREQ_POS)
+            pe_dir_fi = positional_encoding(rd.unsqueeze(1).expand(-1,t_all.shape[-1],3).reshape(-1,3), FREQ_DIR)
+            rgb_fi, sig_fi = model_fine(pe_fi, pe_dir_fi)
+            rgb_fi = rgb_fi.view(-1,t_all.shape[-1],3); sig_fi = sig_fi.view(-1,t_all.shape[-1],1)
+            comp_fi, _, _ = volume_render(rgb_fi, sig_fi, t_all, rd)
+
+            rgb_chunks.append(comp_fi.cpu())
+
+    rgb_map = torch.cat(rgb_chunks,0).reshape(H,W,3).numpy()
+    return rgb_map
+
+if __name__ == '__main__':
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model_coarse = NeRF().to(device); model_fine = NeRF().to(device)
+    ckpt = torch.load(f"{CKPT_DIR}/nerf_hierarchical.pth", map_location=device)
+    model_coarse.load_state_dict(ckpt['coarse']); model_fine.load_state_dict(ckpt['fine'])
+    model_coarse.eval(); model_fine.eval()
+
+    poses, intrinsics, H, W = load_novel_view_data(DATA_DIR, IMG_DIR)
+    qvec, tvec = poses[0]
+
+    img = render_novel_view(model_coarse, model_fine, H, W, intrinsics, qvec, tvec, device=device)
+    img = (255 * np.clip(img,0,1)).astype(np.uint8)
+    os.makedirs("renders", exist_ok=True)
+    Image.fromarray(img).save("renders/view_single.png")
+    print(f"Saved one view (chunk_size={1024}) to renders/view_single.png")
